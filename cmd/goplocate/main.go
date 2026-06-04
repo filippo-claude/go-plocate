@@ -94,7 +94,7 @@ const usageText = `Usage: goplocate [OPTION]... PATTERN...
   -d, --database DBPATH  search for files in DBPATH (may be repeated;
                          colon-separated; default ` + defaultDBFile + `)
   -i, --ignore-case      search case-insensitively
-  -l, --limit LIMIT      stop after LIMIT matches
+  -l, -n, --limit LIMIT  stop after LIMIT matches
   -0, --null             delimit matches by NUL instead of newline
   -N, --literal          do not quote filenames, even if printing to a tty
   -w, --wholename        search the entire path name (default; see -b)
@@ -109,7 +109,7 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-func newFlagSet(cfg *config) (*flag.FlagSet, *bool) {
+func newFlagSet(cfg *config) (*flag.FlagSet, *bool, *bool) {
 	fs := flag.NewFlagSet("goplocate", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
 
@@ -158,19 +158,74 @@ func newFlagSet(cfg *config) (*flag.FlagSet, *bool) {
 	showVersion := fs.Bool("version", false, "")
 	fs.BoolVar(showVersion, "V", false, "")
 
-	return fs, showVersion
+	// Define help ourselves rather than leaning on the flag package's built-in
+	// -h/-help handling, which both prints the usage (via fs.Usage) and returns
+	// ErrHelp, leading to a duplicated message.
+	showHelp := fs.Bool("help", false, "")
+	fs.BoolVar(showHelp, "h", false, "")
+
+	return fs, showVersion, showHelp
+}
+
+// valueFlags are the options that consume a following argument (unless given as
+// -x=value). They are needed by permuteArgs to know how many tokens an option
+// spans while reordering.
+var valueFlags = map[string]bool{
+	"d": true, "database": true,
+	"l": true, "n": true, "limit": true,
+}
+
+// permuteArgs reorders args so that all options precede all operands, the way
+// getopt_long does by default. The standard flag package otherwise stops at the
+// first operand, which would make a common invocation like "goplocate foo -i"
+// treat -i as a pattern rather than a flag. Operands are moved after a "--"
+// terminator so flag treats them verbatim, preserving their relative order.
+func permuteArgs(args []string) []string {
+	var opts, operands []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			operands = append(operands, args[i+1:]...)
+			break
+		}
+		// "-" alone, "" and anything not starting with '-' is an operand.
+		if len(a) < 2 || a[0] != '-' {
+			operands = append(operands, a)
+			continue
+		}
+		opts = append(opts, a)
+		name := strings.TrimLeft(a, "-")
+		eq := strings.IndexByte(name, '=')
+		if eq >= 0 {
+			name = name[:eq]
+		}
+		// A value-taking option spelled "-d value" consumes the next token; one
+		// spelled "-d=value" (eq >= 0) carries its own value.
+		if eq < 0 && valueFlags[name] && i+1 < len(args) {
+			i++
+			opts = append(opts, args[i])
+		}
+	}
+	if len(operands) == 0 {
+		return opts
+	}
+	return append(append(opts, "--"), operands...)
 }
 
 func run(args []string) int {
 	cfg := &config{}
-	fs, showVersion := newFlagSet(cfg)
-	if err := fs.Parse(args); err != nil {
+	fs, showVersion, showHelp := newFlagSet(cfg)
+	if err := fs.Parse(permuteArgs(args)); err != nil {
 		if err == flag.ErrHelp {
 			fmt.Print(usageText)
 			return 0
 		}
 		fmt.Fprintf(os.Stderr, "goplocate: %v\n", err)
 		return 1
+	}
+	if *showHelp {
+		fmt.Print(usageText)
+		return 0
 	}
 	if *showVersion {
 		fmt.Println(version)

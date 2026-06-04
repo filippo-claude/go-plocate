@@ -99,6 +99,9 @@ var queryBattery = [][]string{
 	{"über"},                  // unicode substring
 	{"-i", "ÜBER"},            // unicode ignore-case
 	{"東京"},                    // CJK
+	{"file", "-i"},            // option after pattern (getopt-style permutation)
+	{"makefile", "-b", "-c"},  // several options after pattern
+	{"file", "-l", "2"},       // value option after pattern
 }
 
 func TestParity(t *testing.T) {
