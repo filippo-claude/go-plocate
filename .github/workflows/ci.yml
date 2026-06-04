@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Cross-compile for macOS
+        run: |
+          GOOS=darwin GOARCH=amd64 go build ./...
+          GOOS=darwin GOARCH=arm64 go build ./...
+
+      # The differential tests need the upstream plocate and updatedb binaries.
+      # Build them from the IPv4 GitHub mirror of plocate (upstream git.sesse.net
+      # is IPv6-only). liburing is intentionally omitted so the synchronous read
+      # path is used.
+      - name: Install plocate build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build g++ pkg-config libzstd-dev
+
+      - name: Build upstream plocate (reference oracle)
+        run: |
+          git clone --depth=1 https://github.com/filippo-claude/plocate-mirror.git "$RUNNER_TEMP/plocate"
+          cd "$RUNNER_TEMP/plocate"
+          meson setup obj
+          ninja -C obj plocate updatedb
+          echo "GOPLOCATE_REF_PLOCATE=$RUNNER_TEMP/plocate/obj/plocate" >> "$GITHUB_ENV"
+          echo "GOPLOCATE_REF_UPDATEDB=$RUNNER_TEMP/plocate/obj/updatedb" >> "$GITHUB_ENV"
+
+      - name: Test (differential against upstream)
+        run: go test -count=1 ./...
