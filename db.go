@@ -48,7 +48,9 @@ const magic = "\x00plocate"
 const trigramEntrySize = 16
 
 // header mirrors the on-disk struct Header from plocate's db.h. Only the fields
-// the reader needs are retained.
+// the reader needs are retained. Visibility checking and the other
+// max_version 2 fields are deliberately ignored: this reader targets foreign
+// databases, where checking the local filesystem would be meaningless.
 type header struct {
 	version                  uint32
 	hashtableSize            uint32
@@ -59,7 +61,6 @@ type header struct {
 	maxVersion               uint32
 	zstdDictLengthBytes      uint32
 	zstdDictOffsetBytes      uint64
-	checkVisibility          bool
 }
 
 func parseHeader(b []byte) (header, error) {
@@ -80,7 +81,6 @@ func parseHeader(b []byte) (header, error) {
 		maxVersion:               le.Uint32(b[40:]),
 		zstdDictLengthBytes:      le.Uint32(b[44:]),
 		zstdDictOffsetBytes:      le.Uint64(b[48:]),
-		checkVisibility:          b[104] != 0,
 	}
 	// plocate only understands database versions 0 and 1.
 	if h.version != 0 && h.version != 1 {
@@ -91,9 +91,9 @@ func parseHeader(b []byte) (header, error) {
 		h.zstdDictOffsetBytes = 0
 		h.zstdDictLengthBytes = 0
 	}
-	if h.maxVersion < 2 {
-		// check_visibility (and the other max_version 2 fields) are junk.
-		h.checkVisibility = true
+	// hashtableSize is a divisor in hashTrigram; a zero would divide by zero.
+	if h.hashtableSize == 0 {
+		return header{}, fmt.Errorf("plocate: invalid database (hashtable_size is zero)")
 	}
 	return h, nil
 }
@@ -134,8 +134,20 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 
+	// The filename index holds numDocids+1 uint64 offsets; require it to fit, so
+	// that a forged numDocids cannot drive an unbounded loop or allocation.
+	if hdr.filenameIndexOffsetBytes > uint64(len(data)) ||
+		(uint64(len(data))-hdr.filenameIndexOffsetBytes)/8 < uint64(hdr.numDocids)+1 {
+		syscall.Munmap(data)
+		f.Close()
+		return nil, fmt.Errorf("plocate: filename index extends past end of file")
+	}
+
 	var dopts []zstd.DOption
 	dopts = append(dopts, zstd.WithDecoderConcurrency(0))
+	// Cap decompression memory so a malicious filename block cannot exhaust
+	// memory. Legitimate blocks are at most a few tens of kilobytes.
+	dopts = append(dopts, zstd.WithDecoderMaxMemory(64<<20))
 	if hdr.zstdDictLengthBytes > 0 {
 		end := hdr.zstdDictOffsetBytes + uint64(hdr.zstdDictLengthBytes)
 		if end > uint64(len(data)) {
@@ -168,12 +180,18 @@ func (db *DB) Close() error {
 	return err
 }
 
-// CheckVisibility reports whether the database requests visibility checking
-// (i.e. plocate would stat the parent directories before reporting a file).
-func (db *DB) CheckVisibility() bool { return db.hdr.checkVisibility }
-
 // NumFilenameBlocks returns the number of filename blocks (document IDs).
 func (db *DB) NumFilenameBlocks() int { return int(db.hdr.numDocids) }
+
+// at returns db.data[off:off+n] if that range is fully within the mapping, or
+// ok=false otherwise. All reads of attacker-controlled offsets go through this
+// so that a malformed database produces an error rather than a panic.
+func (db *DB) at(off uint64, n int) ([]byte, bool) {
+	if n < 0 || off > uint64(len(db.data)) || uint64(len(db.data))-off < uint64(n) {
+		return nil, false
+	}
+	return db.data[off : off+uint64(n)], true
+}
 
 // hashTrigram hashes a trigram into a hash-table bucket, matching db.h's
 // hash_trigram (a CRC-like computation).
@@ -196,19 +214,23 @@ type trigram struct {
 	offset    uint64
 }
 
-func (db *DB) readTrigramEntry(index uint64) trigram {
+func (db *DB) readTrigramEntry(index uint64) (trigram, bool) {
 	off := db.hdr.hashTableOffsetBytes + index*trigramEntrySize
-	b := db.data[off:]
+	b, ok := db.at(off, trigramEntrySize)
+	if !ok {
+		return trigram{}, false
+	}
 	le := binary.LittleEndian
 	return trigram{
 		trgm:      le.Uint32(b[0:]),
 		numDocids: le.Uint32(b[4:]),
 		offset:    le.Uint64(b[8:]),
-	}
+	}, true
 }
 
 // findTrigram looks up trgm in the hash table. It returns the entry and the
-// byte length of its posting list, or ok=false if the trigram is absent.
+// byte length of its posting list, or ok=false if the trigram is absent (or the
+// hash table is malformed).
 //
 // This mirrors Corpus::find_trigram: starting at the hashed bucket, scan up to
 // extraHTSlots+1 consecutive entries; the posting list length is the gap to the
@@ -216,9 +238,15 @@ func (db *DB) readTrigramEntry(index uint64) trigram {
 func (db *DB) findTrigram(trgm uint32) (entry trigram, length uint64, ok bool) {
 	bucket := uint64(hashTrigram(trgm, db.hdr.hashtableSize))
 	for i := uint64(0); i < uint64(db.hdr.extraHTSlots)+1; i++ {
-		e := db.readTrigramEntry(bucket + i)
+		e, eok := db.readTrigramEntry(bucket + i)
+		if !eok {
+			return trigram{}, 0, false
+		}
 		if e.trgm == trgm {
-			next := db.readTrigramEntry(bucket + i + 1)
+			next, nok := db.readTrigramEntry(bucket + i + 1)
+			if !nok || next.offset < e.offset {
+				return trigram{}, 0, false
+			}
 			return e, next.offset - e.offset, true
 		}
 	}
@@ -227,14 +255,21 @@ func (db *DB) findTrigram(trgm uint32) (entry trigram, length uint64, ok bool) {
 
 // decodePostingList reads and decodes the posting list for the given entry,
 // returning the list of (strictly increasing) document IDs it contains.
-func (db *DB) decodePostingList(entry trigram, length uint64) []uint32 {
-	start := entry.offset
-	end := start + length
+func (db *DB) decodePostingList(entry trigram, length uint64) ([]uint32, error) {
+	// A posting list cannot reference more blocks than exist, so reject a forged
+	// count before allocating for it.
+	if entry.numDocids > db.hdr.numDocids {
+		return nil, fmt.Errorf("plocate: posting list claims %d docids but only %d blocks exist", entry.numDocids, db.hdr.numDocids)
+	}
+	src, ok := db.at(entry.offset, int(length))
+	if !ok {
+		return nil, fmt.Errorf("plocate: posting list extends past end of file")
+	}
 	// The TurboPFor decoder may read up to turbopfor.Slop bytes past the end of
 	// the posting list. Copy into a padded buffer so we never read out of the
 	// mmap, even for the last list in the file.
 	buf := make([]byte, length+2*turbopfor.Slop)
-	copy(buf, db.data[start:end])
+	copy(buf, src)
 	return turbopfor.Decode(buf, int(entry.numDocids))
 }
 
@@ -242,10 +277,20 @@ func (db *DB) decodePostingList(entry trigram, length uint64) []uint32 {
 // with the given document ID.
 func (db *DB) filenameBlock(docid uint32) ([]byte, error) {
 	idxOff := db.hdr.filenameIndexOffsetBytes + uint64(docid)*8
+	b, ok := db.at(idxOff, 16)
+	if !ok {
+		return nil, fmt.Errorf("plocate: filename index entry %d out of range", docid)
+	}
 	le := binary.LittleEndian
-	off := le.Uint64(db.data[idxOff:])
-	nextOff := le.Uint64(db.data[idxOff+8:])
-	compressed := db.data[off:nextOff]
+	off := le.Uint64(b[0:])
+	nextOff := le.Uint64(b[8:])
+	if nextOff < off {
+		return nil, fmt.Errorf("plocate: filename block %d has negative length", docid)
+	}
+	compressed, ok := db.at(off, int(nextOff-off))
+	if !ok {
+		return nil, fmt.Errorf("plocate: filename block %d extends past end of file", docid)
+	}
 	out, err := db.dec.DecodeAll(compressed, nil)
 	if err != nil {
 		return nil, fmt.Errorf("plocate: decompressing filename block %d: %w", docid, err)

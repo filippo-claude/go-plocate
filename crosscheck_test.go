@@ -72,7 +72,10 @@ func TestPostingListCrossCheck(t *testing.T) {
 				if !ok {
 					t.Fatalf("trigram %#06x present in corpus but not found in hash table", trgm)
 				}
-				got := db.decodePostingList(entry, length)
+				got, derr := db.decodePostingList(entry, length)
+				if derr != nil {
+					t.Fatalf("trigram %#06x: decode failed: %v", trgm, derr)
+				}
 
 				// got must be strictly increasing.
 				for i := 1; i < len(got); i++ {

@@ -100,14 +100,17 @@ func (db *DB) Search(patterns []string, opts Options, visit func(path string) bo
 	})
 
 	decodeCache := map[uint32][]uint32{}
-	decode := func(t uint32) []uint32 {
+	decode := func(t uint32) ([]uint32, error) {
 		if d, ok := decodeCache[t]; ok {
-			return d
+			return d, nil
 		}
 		pl := found[t]
-		d := db.decodePostingList(pl.entry, pl.length)
+		d, err := db.decodePostingList(pl.entry, pl.length)
+		if err != nil {
+			return nil, err
+		}
 		decodeCache[t] = d
-		return d
+		return d, nil
 	}
 
 	var candidates []uint32
@@ -115,7 +118,11 @@ func (db *DB) Search(patterns []string, opts Options, visit func(path string) bo
 		// Union of the present alternatives' posting lists.
 		var union []uint32
 		for _, t := range g.present {
-			union = sortedUnion(union, decode(t))
+			d, err := decode(t)
+			if err != nil {
+				return err
+			}
+			union = sortedUnion(union, d)
 		}
 		if gi == 0 {
 			candidates = union

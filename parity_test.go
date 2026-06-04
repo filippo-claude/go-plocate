@@ -78,7 +78,7 @@ var queryBattery = [][]string{
 	{"-i", "makefile"},
 	{"-b", "main"},
 	{"-b", "-i", "casename"},
-	{"-bc", "data"},
+	{"-b", "-c", "data"},
 	{"-c", "-i", "TXT"},
 	{"data", "config"},        // multiple patterns (AND)
 	{"-i", "alpha", "bravo"},  // AND, ignore-case

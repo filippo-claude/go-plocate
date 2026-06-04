@@ -34,14 +34,18 @@
 // different variant (256-value blocks, no delta), so it cannot be used here;
 // it was consulted only to cross-check understanding of the byte layout.
 //
-// Like the reference implementation, the decoder is NOT robust against
-// malicious or corrupted input. Decode requires that its input slice has at
-// least 16 bytes of readable slop past the encoded data; callers must arrange
-// for this (see Decode).
+// The reference implementation is not robust against malicious or corrupted
+// input. This port keeps the same fast scalar logic but wraps it so that the
+// out-of-bounds slice accesses a malformed posting list could trigger are
+// recovered and returned as an error instead of panicking (see Decode); the
+// process stays memory-safe either way. Decode requires that its input slice
+// has at least 16 bytes of readable slop past the encoded data; callers must
+// arrange for this (see Decode).
 package turbopfor
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/bits"
 )
 
@@ -400,10 +404,21 @@ func decodePForVBInterleaved(in []byte, out []uint32, base int) int {
 // plocate guarantees this by reading posting lists into buffers with 16 bytes
 // of slop. Callers reading from a file should append at least Slop bytes of
 // padding (see the plocate package).
-func Decode(in []byte, num int) []uint32 {
+//
+// A malformed or truncated posting list is reported as an error rather than
+// panicking.
+func Decode(in []byte, num int) (result []uint32, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result, err = nil, fmt.Errorf("turbopfor: malformed posting list: %v", r)
+		}
+	}()
+	if num < 0 {
+		return nil, fmt.Errorf("turbopfor: negative count %d", num)
+	}
 	out := make([]uint32, num)
 	if num == 0 {
-		return out
+		return out, nil
 	}
 	// The first value is stored verbatim; the rest are delta-encoded relative
 	// to it. We use a one-element prefix so that the per-block code can always
@@ -448,5 +463,5 @@ func Decode(in []byte, num int) []uint32 {
 	}
 
 	copy(out, buf[1:])
-	return out
+	return out, nil
 }

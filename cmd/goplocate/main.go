@@ -22,12 +22,15 @@
 // query tool. It opens a plocate database (built by plocate's updatedb or
 // plocate-build) and searches it, supporting the common locate(1) options.
 //
-// Regular-expression matching (-r/--regexp and --regex) is intentionally not
-// supported. See the repository README for details and licensing.
+// It is meant for querying foreign databases, so options that depend on the
+// local filesystem (locate's --existing and its directory-visibility checks)
+// are not implemented. Regular-expression matching (-r/--regexp, --regex) is
+// also not supported.
 package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -41,54 +44,140 @@ const defaultDBFile = "/var/lib/plocate/plocate.db"
 
 const version = "goplocate (go-plocate reader) 0.1.0"
 
-type config struct {
-	basename         bool
-	count            bool
-	ignoreCase       bool
-	limit            int64
-	null             bool
-	literal          bool
-	existing         bool
-	ignoreVisibility bool
-	dbpaths          []string
-	patterns         []string
+// dbPathsValue accumulates database paths. It may be given more than once, and
+// each value is itself a colon-separated list (with backslash escaping), so
+// "-d a:b -d c" searches a, b and c in order, matching plocate.
+type dbPathsValue []string
+
+func (d *dbPathsValue) String() string { return strings.Join(*d, ":") }
+
+func (d *dbPathsValue) Set(s string) error {
+	*d = parseDBPaths(s, *d)
+	return nil
 }
 
-func usage(w *os.File) {
-	fmt.Fprint(w, `Usage: goplocate [OPTION]... PATTERN...
+// limitValue parses a strictly-positive match limit shared by -l, -n and
+// --limit.
+type limitValue struct{ n *int64 }
+
+func (l limitValue) String() string {
+	if l.n == nil || *l.n == 0 {
+		return "0"
+	}
+	return strconv.FormatInt(*l.n, 10)
+}
+
+func (l limitValue) Set(s string) error {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return fmt.Errorf("limit must be a strictly positive number")
+	}
+	*l.n = v
+	return nil
+}
+
+type config struct {
+	basename   bool
+	count      bool
+	ignoreCase bool
+	limit      int64
+	null       bool
+	literal    bool
+	dbpaths    dbPathsValue
+	patterns   []string
+}
+
+const usageText = `Usage: goplocate [OPTION]... PATTERN...
 
   -b, --basename         search only the file name portion of path names
   -c, --count            print number of matches instead of the matches
-  -d, --database DBPATH  search for files in DBPATH
-                         (default is `+defaultDBFile+`)
-  -e, --existing         only print entries for files that exist
+  -d, --database DBPATH  search for files in DBPATH (may be repeated;
+                         colon-separated; default ` + defaultDBFile + `)
   -i, --ignore-case      search case-insensitively
   -l, --limit LIMIT      stop after LIMIT matches
   -0, --null             delimit matches by NUL instead of newline
   -N, --literal          do not quote filenames, even if printing to a tty
   -w, --wholename        search the entire path name (default; see -b)
-      --ignore-visibility  do not check directory visibility
       --help             print this help
       --version          print version information
 
-Regular-expression patterns (-r/--regexp, --regex) are not supported.
-`)
-}
+Regular-expression patterns (-r/--regexp, --regex) and the filesystem-dependent
+options (-e/--existing, directory-visibility checks) are not supported.
+`
 
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+func newFlagSet(cfg *config) (*flag.FlagSet, *bool) {
+	fs := flag.NewFlagSet("goplocate", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
+
+	// -b/-w toggle the same field; using BoolFunc preserves left-to-right
+	// precedence (e.g. "-b -w" ends up searching whole names).
+	setBasename := func(v bool) func(string) error {
+		return func(string) error { cfg.basename = v; return nil }
+	}
+	fs.BoolFunc("b", "", setBasename(true))
+	fs.BoolFunc("basename", "", setBasename(true))
+	fs.BoolFunc("w", "", setBasename(false))
+	fs.BoolFunc("wholename", "", setBasename(false))
+
+	for _, p := range []struct {
+		short, long string
+		dst         *bool
+	}{
+		{"c", "count", &cfg.count},
+		{"i", "ignore-case", &cfg.ignoreCase},
+		{"0", "null", &cfg.null},
+		{"N", "literal", &cfg.literal},
+	} {
+		fs.BoolVar(p.dst, p.short, false, "")
+		fs.BoolVar(p.dst, p.long, false, "")
+	}
+
+	fs.Var(&cfg.dbpaths, "d", "")
+	fs.Var(&cfg.dbpaths, "database", "")
+
+	lim := limitValue{n: &cfg.limit}
+	fs.Var(lim, "l", "")
+	fs.Var(lim, "n", "")
+	fs.Var(lim, "limit", "")
+
+	// Accepted and ignored, as in plocate.
+	fs.BoolFunc("A", "", func(string) error { return nil })
+	fs.BoolFunc("all", "", func(string) error { return nil })
+
+	unsupported := func(string) error {
+		return fmt.Errorf("regular-expression matching is not supported")
+	}
+	fs.BoolFunc("r", "", unsupported)
+	fs.BoolFunc("regexp", "", unsupported)
+	fs.BoolFunc("regex", "", unsupported)
+
+	showVersion := fs.Bool("version", false, "")
+	fs.BoolVar(showVersion, "V", false, "")
+
+	return fs, showVersion
+}
+
 func run(args []string) int {
-	cfg, err := parseArgs(args)
-	if err != nil {
+	cfg := &config{}
+	fs, showVersion := newFlagSet(cfg)
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			fmt.Print(usageText)
+			return 0
+		}
 		fmt.Fprintf(os.Stderr, "goplocate: %v\n", err)
 		return 1
 	}
-	if cfg == nil {
-		return 0 // --help or --version already handled
+	if *showVersion {
+		fmt.Println(version)
+		return 0
 	}
 
+	cfg.patterns = fs.Args()
 	if len(cfg.patterns) == 0 {
 		fmt.Fprintln(os.Stderr, "goplocate: no pattern to search for specified")
 		return 1
@@ -108,8 +197,6 @@ func run(args []string) int {
 	opts := plocate.Options{IgnoreCase: cfg.ignoreCase, Basename: cfg.basename}
 
 	var matched int64
-	vis := newVisibilityCache()
-
 	for _, dbpath := range cfg.dbpaths {
 		if cfg.limit > 0 && matched >= cfg.limit {
 			break
@@ -119,17 +206,7 @@ func run(args []string) int {
 			fmt.Fprintf(os.Stderr, "goplocate: %v\n", err)
 			return 1
 		}
-		checkVis := db.CheckVisibility() && !cfg.ignoreVisibility
-
 		serr := db.Search(cfg.patterns, opts, func(path string) bool {
-			if checkVis && !vis.visible(path) {
-				return true // not visible: skip, keep going
-			}
-			if cfg.existing {
-				if _, err := os.Lstat(path); err != nil {
-					return true
-				}
-			}
 			matched++
 			if !cfg.count {
 				printName(out, path, cfg, toTTY)
@@ -152,141 +229,6 @@ func run(args []string) int {
 		return 1
 	}
 	return 0
-}
-
-func parseArgs(args []string) (*config, error) {
-	cfg := &config{}
-	i := 0
-	takeArg := func(inline string, hasInline bool) (string, error) {
-		if hasInline {
-			return inline, nil
-		}
-		if i+1 >= len(args) {
-			return "", fmt.Errorf("option requires an argument")
-		}
-		i++
-		return args[i], nil
-	}
-	parsingOpts := true
-	for ; i < len(args); i++ {
-		a := args[i]
-		if !parsingOpts || a == "" || a[0] != '-' || a == "-" {
-			cfg.patterns = append(cfg.patterns, a)
-			continue
-		}
-		if a == "--" {
-			parsingOpts = false
-			continue
-		}
-		if strings.HasPrefix(a, "--") {
-			name := a[2:]
-			val := ""
-			hasVal := false
-			if eq := strings.IndexByte(name, '='); eq >= 0 {
-				val, hasVal = name[eq+1:], true
-				name = name[:eq]
-			}
-			switch name {
-			case "basename":
-				cfg.basename = true
-			case "count":
-				cfg.count = true
-			case "ignore-case":
-				cfg.ignoreCase = true
-			case "literal":
-				cfg.literal = true
-			case "null":
-				cfg.null = true
-			case "wholename":
-				cfg.basename = false
-			case "existing":
-				cfg.existing = true
-			case "all":
-				// Accepted and ignored, as in plocate.
-			case "ignore-visibility":
-				cfg.ignoreVisibility = true
-			case "database":
-				v, err := takeArg(val, hasVal)
-				if err != nil {
-					return nil, err
-				}
-				cfg.dbpaths = parseDBPaths(v, cfg.dbpaths)
-			case "limit":
-				v, err := takeArg(val, hasVal)
-				if err != nil {
-					return nil, err
-				}
-				if err := setLimit(cfg, v); err != nil {
-					return nil, err
-				}
-			case "regexp", "regex":
-				return nil, fmt.Errorf("regular-expression matching is not supported")
-			case "help":
-				usage(os.Stdout)
-				return nil, nil
-			case "version":
-				fmt.Println(version)
-				return nil, nil
-			default:
-				return nil, fmt.Errorf("unrecognized option '--%s'", name)
-			}
-			continue
-		}
-		// Short option cluster.
-		flags := a[1:]
-		for j := 0; j < len(flags); j++ {
-			c := flags[j]
-			rest := flags[j+1:]
-			switch c {
-			case 'b':
-				cfg.basename = true
-			case 'c':
-				cfg.count = true
-			case 'i':
-				cfg.ignoreCase = true
-			case 'N':
-				cfg.literal = true
-			case '0':
-				cfg.null = true
-			case 'w':
-				cfg.basename = false
-			case 'e':
-				cfg.existing = true
-			case 'A':
-				// Accepted and ignored.
-			case 'd':
-				v, err := takeArg(rest, rest != "")
-				if err != nil {
-					return nil, err
-				}
-				cfg.dbpaths = parseDBPaths(v, cfg.dbpaths)
-				j = len(flags)
-			case 'l', 'n':
-				v, err := takeArg(rest, rest != "")
-				if err != nil {
-					return nil, err
-				}
-				if err := setLimit(cfg, v); err != nil {
-					return nil, err
-				}
-				j = len(flags)
-			case 'r':
-				return nil, fmt.Errorf("regular-expression matching is not supported")
-			default:
-				return nil, fmt.Errorf("invalid option -- '%c'", c)
-			}
-		}
-	}
-	return cfg, nil
-}
-
-func setLimit(cfg *config, s string) error {
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n <= 0 {
-		return fmt.Errorf("limit must be a strictly positive number")
-	}
-	cfg.limit = n
-	return nil
 }
 
 // parseDBPaths parses a colon-separated list of database paths, where a

@@ -77,7 +77,10 @@ func TestDecoderCoverage(t *testing.T) {
 	if !ok {
 		t.Fatalf("longest trigram %#06x not found", longestTrgm)
 	}
-	got := db.decodePostingList(entry, length)
+	got, derr := db.decodePostingList(entry, length)
+	if derr != nil {
+		t.Fatalf("decoding longest posting list: %v", derr)
+	}
 	if len(got) != int(entry.numDocids) {
 		t.Errorf("decoded %d docids, header says %d", len(got), entry.numDocids)
 	}

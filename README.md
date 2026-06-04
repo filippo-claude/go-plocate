@@ -40,10 +40,19 @@ Implemented (the read/query path only):
 
 ### Supported `goplocate` options
 
-`-b/--basename`, `-i/--ignore-case`, `-c/--count`, `-d/--database` (colon-separated
-list with backslash escaping, plus `LOCATE_PATH`), `-l/-n/--limit`,
-`-0/--null`, `-N/--literal`, `-w/--wholename`, `-e/--existing`, `-A/--all`
-(accepted and ignored), `--ignore-visibility`, `--help`, `--version`.
+`-b/--basename`, `-i/--ignore-case`, `-c/--count`, `-d/--database` (may be given
+more than once; each value is a colon-separated list with backslash escaping;
+also honors `LOCATE_PATH`), `-l/-n/--limit`, `-0/--null`, `-N/--literal`,
+`-w/--wholename`, `-A/--all` (accepted and ignored), `--help`, `--version`.
+
+The CLI uses the standard library `flag` package, so it does **not** support
+bundling short flags (`-bc`); write `-b -c`. Both `-x` and `--x` spellings work.
+
+Filesystem-dependent options are intentionally omitted, because this tool is
+meant for querying **foreign** databases where checking the local filesystem
+would be meaningless: locate's `-e/--existing` and its directory-visibility
+checking are not implemented (results are reported regardless of whether the
+listed files currently exist or are visible).
 
 ## Usage
 
@@ -65,10 +74,27 @@ err = db.Search([]string{"needle"}, plocate.Options{IgnoreCase: true}, func(path
 })
 ```
 
-Note that visibility checking (the `require_visibility` feature) and `--existing`
-are applied by the `goplocate` command, not by the library `Search` method; the
-library reports every filename that matches the patterns, and the caller decides
-what to do with each.
+The library `Search` method reports every filename that matches the patterns,
+and the caller decides what to do with each (the `goplocate` command just prints
+and counts them).
+
+## Robustness against untrusted databases
+
+This reader is intended to be pointed at databases from other machines, so it
+treats the database as untrusted. It is pure Go with no cgo and no `unsafe`, so
+it cannot suffer memory-corruption or code-execution bugs from a malformed file.
+On top of that, it bounds-checks every attacker-controlled offset and length
+against the file size, caps allocations (a posting list cannot claim more
+documents than the database has blocks; zstd decompression is memory-limited),
+and converts the out-of-bounds accesses a corrupt posting list might otherwise
+trigger into errors. The result: a malformed database yields an error or empty
+results, never a panic or runaway allocation. `TestAdversarialDatabases`
+exercises this with single-byte mutations, truncations, and random inputs.
+
+Note this is about *robustness*, not authentication: a crafted database can
+still make the tool *report* whatever filenames it likes. Don't treat
+`goplocate` output from an untrusted database as a trustworthy listing of a real
+filesystem.
 
 ## Testing
 
