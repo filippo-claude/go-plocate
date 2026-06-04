@@ -1,0 +1,50 @@
+go-plocate
+==========
+
+This product is a derivative work of plocate.
+
+  plocate is Copyright 2020 Steinar H. Gunderson <steinar+plocate@gunderson.no>
+  and is licensed under the GNU General Public License, version 2 or (at your
+  option) any later version. Upstream: https://git.sesse.net/plocate
+
+  The Go port in this repository (go-plocate) is Copyright 2026 Filippo Valsorda
+  and is likewise licensed under the GNU General Public License, version 2 or
+  (at your option) any later version (GPL-2.0-or-later). See the file COPYING.
+
+Nature of the derivative work and changes
+-----------------------------------------
+
+go-plocate was produced by an LLM agent (Anthropic's Claude) as a partial
+reimplementation of plocate in the Go programming language. It is NOT a verbatim
+copy; it is a translation and reduction. Specifically:
+
+  * Only the database READ/QUERY path was ported. The database-building tools
+    (updatedb, plocate-build) and all of their supporting code (filesystem
+    scanning, bind-mount handling, configuration parsing, the TurboPFor encoder)
+    were NOT ported.
+
+  * The TurboPFor posting-list decoder is a port of the scalar (non-SIMD) code
+    path of plocate's turbopfor.cpp, limited to the single codec plocate emits
+    (delta-plus-1, interleaved, 128-value blocks, 32-bit document IDs).
+
+  * Regular-expression matching (-r/--regexp, --regex) was deliberately omitted.
+
+  * I/O uses memory mapping and synchronous reads rather than io_uring; output
+    serialization, the trigram parser, the glob matcher (fnmatch), and the
+    directory-visibility check were reimplemented in Go to match the observable
+    behavior of upstream plocate.
+
+The file COPYING (the GNU General Public License, version 2) is reproduced from
+the upstream plocate distribution.
+
+Third-party references
+----------------------
+
+  * Michael Stapelberg's TurboPFor analysis was used as documentation of the
+    on-disk posting-list format:
+    https://michael.stapelberg.ch/posts/2019-02-05-turbopfor-analysis/
+
+  * Stapelberg's goturbopfor (https://github.com/stapelberg/goturbopfor,
+    Apache-2.0) targets a different TurboPFor variant and was NOT copied into
+    this work; it was consulted only as a cross-reference for the byte layout.
+    No Apache-2.0 code is included here.
